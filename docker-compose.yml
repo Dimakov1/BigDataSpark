@@ -1,0 +1,73 @@
+networks:
+  bigdata_net:
+    driver: bridge
+
+services:
+
+  postgres:
+    image: postgres:15
+    container_name: spark_postgres
+    environment:
+      POSTGRES_DB: petshop
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/01_init_raw.sql:/docker-entrypoint-initdb.d/01_init_raw.sql
+      - ./исходные данные:/csv_data
+    networks:
+      - bigdata_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: spark_clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    environment:
+      CLICKHOUSE_DB: reports
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    networks:
+      - bigdata_net
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  spark-master:
+    image: apache/spark:3.5.1-python3
+    container_name: spark_master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    environment:
+      - SPARK_MASTER_HOST=spark_master
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_WEBUI_PORT=8080
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    volumes:
+      - ./spark:/opt/spark-jobs
+    networks:
+      bigdata_net:
+        aliases:
+          - spark_master
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+
+
+volumes:
+  postgres_data:
+  clickhouse_data:

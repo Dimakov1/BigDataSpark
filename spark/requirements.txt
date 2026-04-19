@@ -1,0 +1,4 @@
+pyspark==3.5.0
+psycopg2-binary==2.9.9
+clickhouse-connect==0.6.23
+pandas==2.1.4
