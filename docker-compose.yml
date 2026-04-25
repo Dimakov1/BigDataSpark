@@ -3,7 +3,6 @@ networks:
     driver: bridge
 
 services:
-
   postgres:
     image: postgres:15
     container_name: spark_postgres
@@ -28,17 +27,21 @@ services:
   clickhouse:
     image: clickhouse/clickhouse-server:24.3
     container_name: spark_clickhouse
+    hostname: spark-clickhouse
     ports:
       - "8123:8123"
       - "9000:9000"
     volumes:
       - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse/init/01_reports_schema.sql:/docker-entrypoint-initdb.d/01_reports_schema.sql
     environment:
       CLICKHOUSE_DB: reports
       CLICKHOUSE_USER: default
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     networks:
-      - bigdata_net
+      bigdata_net:
+        aliases:
+          - spark-clickhouse
     healthcheck:
       test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1' || exit 1"]
       interval: 15s
@@ -65,8 +68,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-
-
+      clickhouse:
+        condition: service_healthy
 
 volumes:
   postgres_data:

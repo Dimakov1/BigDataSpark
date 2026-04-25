@@ -1,6 +1,6 @@
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-import clickhouse_connect
+from pyspark.sql.window import Window
 
 PG_URL = "jdbc:postgresql://spark_postgres:5432/petshop"
 PG_PROPS = {
@@ -9,13 +9,27 @@ PG_PROPS = {
     "driver": "org.postgresql.Driver"
 }
 
-CH_HOST = "spark_clickhouse"
-CH_PORT = 8123
-CH_DB   = "reports"
+CH_URL = "jdbc:ch://spark-clickhouse:8123/reports"
+CH_PROPS = {
+    "user": "default",
+    "password": "",
+    "driver": "com.clickhouse.jdbc.ClickHouseDriver"
+}
 
 spark = SparkSession.builder \
     .appName("Reports_ClickHouse") \
-    .config("spark.jars", "/opt/spark-jobs/jars/postgresql-42.7.3.jar") \
+    .config(
+        "spark.jars",
+        "/opt/spark-jobs/jars/postgresql-42.7.3.jar,/opt/spark-jobs/jars/clickhouse-jdbc-0.9.8-all.jar"
+    ) \
+    .config(
+        "spark.driver.extraClassPath",
+        "/opt/spark-jobs/jars/postgresql-42.7.3.jar:/opt/spark-jobs/jars/clickhouse-jdbc-0.9.8-all.jar"
+    ) \
+    .config(
+        "spark.executor.extraClassPath",
+        "/opt/spark-jobs/jars/postgresql-42.7.3.jar:/opt/spark-jobs/jars/clickhouse-jdbc-0.9.8-all.jar"
+    ) \
     .getOrCreate()
 
 spark.sparkContext.setLogLevel("WARN")
@@ -31,280 +45,175 @@ suppliers = read_pg("dim_supplier")
 
 facts.cache()
 
-ch = clickhouse_connect.get_client(host=CH_HOST, port=CH_PORT, database=CH_DB)
 
-def write_ch(df, table, ddl):
-    ch.command(f"DROP TABLE IF EXISTS {table}")
-    ch.command(ddl)
-    pdf = df.toPandas()
-    ch.insert_df(table, pdf)
-    print(f"Written {len(pdf)} rows → ClickHouse:{table}")
+def write_ch(df, table):
+    (
+        df.write
+        .format("jdbc")
+        .option("url", CH_URL)
+        .option("dbtable", table)
+        .option("user", CH_PROPS["user"])
+        .option("password", CH_PROPS["password"])
+        .option("driver", CH_PROPS["driver"])
+        .mode("append")
+        .save()
+    )
+    print(f"Written {df.count()} rows → ClickHouse:{table}")
 
 
-top_products = facts.join(
+facts_products = facts.join(
     products,
     (facts.product_name == products.product_name) &
     (facts.product_brand == products.brand),
     "left"
-).groupBy(
-    facts.product_name, products.brand, products.category
+)
+
+product_sales = facts_products.groupBy(
+    facts.product_name.alias("product_name"),
+    products.brand.alias("brand"),
+    products.category.alias("category")
 ).agg(
-    F.sum("sale_quantity").alias("total_units_sold"),
-    F.sum("sale_total_price").alias("total_revenue"),
-    F.count("sale_quantity").alias("sales_count")
-).orderBy(F.desc("total_units_sold")).limit(10)
-
-write_ch(top_products, "report_top_products", """
-CREATE TABLE report_top_products (
-    product_name     String,
-    brand            String,
-    category         String,
-    total_units_sold Int64,
-    total_revenue    Float64,
-    sales_count      Int64
-) ENGINE = MergeTree() ORDER BY total_units_sold
-""")
-
-revenue_by_category = facts.join(
-    products,
-    (facts.product_name == products.product_name) &
-    (facts.product_brand == products.brand),
-    "left"
-).groupBy(products.category).agg(
-    F.sum("sale_total_price").alias("total_revenue"),
-    F.sum("sale_quantity").alias("total_units_sold"),
-    F.count("*").alias("sales_count")
-).orderBy(F.desc("total_revenue"))
-
-write_ch(revenue_by_category, "report_revenue_by_category", """
-CREATE TABLE report_revenue_by_category (
-    category         String,
-    total_revenue    Float64,
-    total_units_sold Int64,
-    sales_count      Int64
-) ENGINE = MergeTree() ORDER BY total_revenue
-""")
+    F.sum(facts.sale_quantity).cast("long").alias("total_units_sold"),
+    F.sum(facts.sale_total_price).cast("double").alias("total_revenue"),
+    F.count("*").cast("long").alias("sales_count")
+)
 
 product_ratings = products.select(
-    "product_name", "brand", "category", "rating", "reviews", "price"
-).orderBy(F.desc("rating"))
+    products.product_name.alias("product_name"),
+    products.brand.alias("brand"),
+    products.category.alias("category"),
+    products.rating.cast("double").alias("avg_rating"),
+    products.reviews.cast("long").alias("reviews_count")
+)
 
-write_ch(product_ratings, "report_product_ratings", """
-CREATE TABLE report_product_ratings (
-    product_name String,
-    brand        String,
-    category     String,
-    rating       Float32,
-    reviews      Int32,
-    price        Float64
-) ENGINE = MergeTree() ORDER BY rating
-""")
+category_revenue = facts_products.groupBy(products.category.alias("category")).agg(
+    F.sum(facts.sale_total_price).cast("double").alias("category_total_revenue"),
+    F.sum(facts.sale_quantity).cast("long").alias("category_total_units_sold"),
+    F.count("*").cast("long").alias("category_sales_count")
+)
 
-top_customers = facts.join(
-    customers, facts.customer_email == customers.email, "left"
-).groupBy(
-    customers.email, customers.first_name,
-    customers.last_name, customers.country
+report_products = product_sales \
+    .join(product_ratings, ["product_name", "brand", "category"], "left") \
+    .join(category_revenue, "category", "left") \
+    .withColumn("product_sales_rank", F.row_number().over(Window.orderBy(F.desc("total_units_sold"))))
+
+write_ch(report_products, "report_products")
+
+customer_sales = facts.join(customers, facts.customer_email == customers.email, "left").groupBy(
+    customers.email.alias("email"),
+    customers.first_name.alias("first_name"),
+    customers.last_name.alias("last_name"),
+    customers.country.alias("country")
 ).agg(
-    F.sum("sale_total_price").alias("total_spent"),
-    F.count("*").alias("orders_count"),
-    F.avg("sale_total_price").alias("avg_order_value")
-).orderBy(F.desc("total_spent")).limit(10)
+    F.sum(facts.sale_total_price).cast("double").alias("total_spent"),
+    F.count("*").cast("long").alias("orders_count"),
+    F.avg(facts.sale_total_price).cast("double").alias("avg_check")
+)
 
-write_ch(top_customers, "report_top_customers", """
-CREATE TABLE report_top_customers (
-    email           String,
-    first_name      String,
-    last_name       String,
-    country         String,
-    total_spent     Float64,
-    orders_count    Int64,
-    avg_order_value Float64
-) ENGINE = MergeTree() ORDER BY total_spent
-""")
-
-customers_by_country = facts.join(
-    customers, facts.customer_email == customers.email, "left"
-).groupBy(customers.country).agg(
-    F.countDistinct("customer_email").alias("unique_customers"),
-    F.sum("sale_total_price").alias("total_revenue"),
-    F.avg("sale_total_price").alias("avg_order_value")
-).orderBy(F.desc("total_revenue"))
-
-write_ch(customers_by_country, "report_customers_by_country", """
-CREATE TABLE report_customers_by_country (
-    country          String,
-    unique_customers Int64,
-    total_revenue    Float64,
-    avg_order_value  Float64
-) ENGINE = MergeTree() ORDER BY total_revenue
-""")
-
-avg_check = facts.join(
-    customers, facts.customer_email == customers.email, "left"
-).groupBy(
-    customers.email, customers.first_name, customers.last_name
+customers_by_country = facts.join(customers, facts.customer_email == customers.email, "left").groupBy(
+    customers.country.alias("country")
 ).agg(
-    F.avg("sale_total_price").alias("avg_check"),
-    F.sum("sale_total_price").alias("total_spent"),
-    F.count("*").alias("orders_count")
-).orderBy(F.desc("avg_check"))
+    F.countDistinct(facts.customer_email).cast("long").alias("country_unique_customers"),
+    F.sum(facts.sale_total_price).cast("double").alias("country_total_revenue"),
+    F.avg(facts.sale_total_price).cast("double").alias("country_avg_order_value")
+)
 
-write_ch(avg_check, "report_customer_avg_check", """
-CREATE TABLE report_customer_avg_check (
-    email        String,
-    first_name   String,
-    last_name    String,
-    avg_check    Float64,
-    total_spent  Float64,
-    orders_count Int64
-) ENGINE = MergeTree() ORDER BY avg_check
-""")
+report_customers = customer_sales \
+    .join(customers_by_country, "country", "left") \
+    .withColumn("customer_spending_rank", F.row_number().over(Window.orderBy(F.desc("total_spent"))))
+
+write_ch(report_customers, "report_customers")
 
 sales_with_date = facts.filter(F.col("sale_date").isNotNull()) \
-    .withColumn("year",       F.year("sale_date")) \
-    .withColumn("month",      F.month("sale_date")) \
-    .withColumn("year_month", F.date_format("sale_date", "yyyy-MM"))
+    .withColumn("year", F.year("sale_date")) \
+    .withColumn("month", F.month("sale_date")) \
+    .withColumn("period", F.date_format("sale_date", "yyyy-MM"))
 
-monthly_trends = sales_with_date.groupBy("year", "month", "year_month").agg(
-    F.sum("sale_total_price").alias("total_revenue"),
-    F.count("*").alias("sales_count"),
-    F.avg("sale_total_price").alias("avg_order_value"),
-    F.sum("sale_quantity").alias("total_units_sold")
-).orderBy("year", "month")
+monthly = sales_with_date.groupBy("year", "month", "period").agg(
+    F.sum("sale_total_price").cast("double").alias("total_revenue"),
+    F.count("*").cast("long").alias("sales_count"),
+    F.avg("sale_total_price").cast("double").alias("avg_order_value"),
+    F.sum("sale_quantity").cast("long").alias("total_units_sold")
+).withColumn("period_type", F.lit("month"))
 
-write_ch(monthly_trends, "report_monthly_trends", """
-CREATE TABLE report_monthly_trends (
-    year             Int32,
-    month            Int32,
-    year_month       String,
-    total_revenue    Float64,
-    sales_count      Int64,
-    avg_order_value  Float64,
-    total_units_sold Int64
-) ENGINE = MergeTree() ORDER BY (year, month)
-""")
+yearly = sales_with_date.groupBy("year").agg(
+    F.sum("sale_total_price").cast("double").alias("year_total_revenue"),
+    F.count("*").cast("long").alias("year_sales_count"),
+    F.avg("sale_total_price").cast("double").alias("year_avg_order_value")
+)
 
-yearly_trends = sales_with_date.groupBy("year").agg(
-    F.sum("sale_total_price").alias("total_revenue"),
-    F.count("*").alias("sales_count"),
-    F.avg("sale_total_price").alias("avg_order_value")
-).orderBy("year")
+report_time = monthly.join(yearly, "year", "left") \
+    .withColumn("previous_period_revenue", F.lag("total_revenue").over(Window.orderBy("year", "month"))) \
+    .withColumn("revenue_diff_vs_previous_period", F.col("total_revenue") - F.col("previous_period_revenue")) \
+    .withColumn(
+        "revenue_pct_diff_vs_previous_period",
+        F.when(F.col("previous_period_revenue").isNull() | (F.col("previous_period_revenue") == 0), None)
+         .otherwise((F.col("total_revenue") - F.col("previous_period_revenue")) / F.col("previous_period_revenue") * 100)
+         .cast("double")
+    )
 
-write_ch(yearly_trends, "report_yearly_trends", """
-CREATE TABLE report_yearly_trends (
-    year            Int32,
-    total_revenue   Float64,
-    sales_count     Int64,
-    avg_order_value Float64
-) ENGINE = MergeTree() ORDER BY year
-""")
+write_ch(report_time, "report_time")
 
-top_stores = facts.join(
-    stores, facts.store_email == stores.email, "left"
-).groupBy(
-    stores.email, stores.store_name, stores.city, stores.country
+store_sales = facts.join(stores, facts.store_email == stores.email, "left").groupBy(
+    stores.email.alias("email"),
+    stores.store_name.alias("store_name"),
+    stores.city.alias("city"),
+    stores.country.alias("country")
 ).agg(
-    F.sum("sale_total_price").alias("total_revenue"),
-    F.count("*").alias("sales_count"),
-    F.avg("sale_total_price").alias("avg_check")
-).orderBy(F.desc("total_revenue")).limit(5)
+    F.sum(facts.sale_total_price).cast("double").alias("total_revenue"),
+    F.count("*").cast("long").alias("sales_count"),
+    F.avg(facts.sale_total_price).cast("double").alias("avg_check")
+)
 
-write_ch(top_stores, "report_top_stores", """
-CREATE TABLE report_top_stores (
-    email         String,
-    store_name    String,
-    city          String,
-    country       String,
-    total_revenue Float64,
-    sales_count   Int64,
-    avg_check     Float64
-) ENGINE = MergeTree() ORDER BY total_revenue
-""")
-
-sales_by_location = facts.join(
-    stores, facts.store_email == stores.email, "left"
-).groupBy(stores.city, stores.country).agg(
-    F.sum("sale_total_price").alias("total_revenue"),
-    F.count("*").alias("sales_count"),
-    F.avg("sale_total_price").alias("avg_check")
-).orderBy(F.desc("total_revenue"))
-
-write_ch(sales_by_location, "report_sales_by_location", """
-CREATE TABLE report_sales_by_location (
-    city          String,
-    country       String,
-    total_revenue Float64,
-    sales_count   Int64,
-    avg_check     Float64
-) ENGINE = MergeTree() ORDER BY total_revenue
-""")
-
-top_suppliers = facts.join(
-    suppliers, facts.supplier_email == suppliers.email, "left"
-).groupBy(
-    suppliers.email, suppliers.supplier_name, suppliers.country
+store_location = facts.join(stores, facts.store_email == stores.email, "left").groupBy(
+    stores.city.alias("city"),
+    stores.country.alias("country")
 ).agg(
-    F.sum("sale_total_price").alias("total_revenue"),
-    F.count("*").alias("sales_count")
-).orderBy(F.desc("total_revenue")).limit(5)
+    F.sum(facts.sale_total_price).cast("double").alias("location_total_revenue"),
+    F.count("*").cast("long").alias("location_sales_count"),
+    F.avg(facts.sale_total_price).cast("double").alias("location_avg_check")
+)
 
-write_ch(top_suppliers, "report_top_suppliers", """
-CREATE TABLE report_top_suppliers (
-    email         String,
-    supplier_name String,
-    country       String,
-    total_revenue Float64,
-    sales_count   Int64
-) ENGINE = MergeTree() ORDER BY total_revenue
-""")
+report_stores = store_sales \
+    .join(store_location, ["city", "country"], "left") \
+    .withColumn("store_revenue_rank", F.row_number().over(Window.orderBy(F.desc("total_revenue"))))
 
-supplier_stats = facts.join(
-    suppliers, facts.supplier_email == suppliers.email, "left"
-).join(
-    products,
-    (facts.product_name == products.product_name) &
-    (facts.product_brand == products.brand),
-    "left"
-).groupBy(suppliers.country).agg(
-    F.avg(products.price).alias("avg_product_price"),
-    F.sum(facts.sale_total_price).alias("total_revenue"),
-    F.count("*").alias("sales_count")
-).orderBy(F.desc("total_revenue"))
+write_ch(report_stores, "report_stores")
 
-write_ch(supplier_stats, "report_supplier_by_country", """
-CREATE TABLE report_supplier_by_country (
-    country           String,
-    avg_product_price Float64,
-    total_revenue     Float64,
-    sales_count       Int64
-) ENGINE = MergeTree() ORDER BY total_revenue
-""")
-
-product_quality = facts.join(
-    products,
-    (facts.product_name == products.product_name) &
-    (facts.product_brand == products.brand),
-    "left"
-).groupBy(
-    products.product_name, products.brand, products.category,
-    products.rating, products.reviews
+supplier_sales = facts_products.join(suppliers, facts.supplier_email == suppliers.email, "left").groupBy(
+    suppliers.email.alias("email"),
+    suppliers.supplier_name.alias("supplier_name"),
+    suppliers.country.alias("country")
 ).agg(
-    F.sum(facts.sale_quantity).alias("total_units_sold"),
-    F.sum(facts.sale_total_price).alias("total_revenue")
-).orderBy(F.desc("rating"), F.desc("reviews"))
+    F.sum(facts.sale_total_price).cast("double").alias("total_revenue"),
+    F.count("*").cast("long").alias("sales_count"),
+    F.avg(products.price).cast("double").alias("avg_product_price")
+)
 
-write_ch(product_quality, "report_product_quality", """
-CREATE TABLE report_product_quality (
-    product_name     String,
-    brand            String,
-    category         String,
-    rating           Float32,
-    reviews          Int32,
-    total_units_sold Int64,
-    total_revenue    Float64
-) ENGINE = MergeTree() ORDER BY rating
-""")
+supplier_country = facts_products.join(suppliers, facts.supplier_email == suppliers.email, "left").groupBy(
+    suppliers.country.alias("country")
+).agg(
+    F.sum(facts.sale_total_price).cast("double").alias("country_total_revenue"),
+    F.count("*").cast("long").alias("country_sales_count")
+)
 
-print("All 6 reports written to ClickHouse successfully!")
+report_suppliers = supplier_sales \
+    .join(supplier_country, "country", "left") \
+    .withColumn("supplier_revenue_rank", F.row_number().over(Window.orderBy(F.desc("total_revenue"))))
+
+write_ch(report_suppliers, "report_suppliers")
+
+quality_base = product_sales.join(product_ratings, ["product_name", "brand", "category"], "left")
+quality_corr = quality_base.agg(
+    F.corr(F.col("avg_rating"), F.col("total_units_sold")).cast("double").alias("rating_sales_correlation")
+)
+
+report_quality = quality_base.crossJoin(quality_corr) \
+    .withColumn("rating_rank_desc", F.row_number().over(Window.orderBy(F.desc("avg_rating")))) \
+    .withColumn("rating_rank_asc", F.row_number().over(Window.orderBy(F.asc("avg_rating")))) \
+    .withColumn("reviews_rank", F.row_number().over(Window.orderBy(F.desc("reviews_count"))))
+
+write_ch(report_quality, "report_quality")
+
+print("All 6 ClickHouse report tables written successfully!")
 spark.stop()
